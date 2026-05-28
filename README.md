@@ -185,7 +185,7 @@ citlali-llm-engine/
 
 ### Performance
 
-Tested on Intel i7-12700H (laptop CPU), Qwen3-0.6B Q4_K:
+Tested on Intel i7-14650HX (laptop CPU), Qwen3-0.6B Q4_K:
 
 | Mode | Prefill | Generation |
 |------|---------|------------|
@@ -386,7 +386,7 @@ citlali-llm-engine/
 
 ### 性能
 
-在 Intel i7-12700H（笔记本 CPU）上测试，Qwen3-0.6B Q4_K：
+在 Intel i7-14650HX（笔记本 CPU）上测试，Qwen3-0.6B Q4_K：
 
 | 模式 | Prefill | 生成 |
 |------|---------|------|
