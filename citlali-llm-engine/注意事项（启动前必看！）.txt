@@ -1,0 +1,4 @@
+把模型的gguf文件丢进model文件夹里，然后双击start.bat就行
+
+注意：
+model文件夹里只能有一个gguf文件，如果有多个gguf默认是运行的第一个gguf
