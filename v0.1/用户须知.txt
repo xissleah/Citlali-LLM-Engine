@@ -1,0 +1,13 @@
+注意：
+1. v0.1版本仅支持qwen3（dense），仅支持gguf格式
+2. v0.1支持的量化方式有：
+
+编译.cmd需要以下组件才能正常运行：
+1. CMake
+2. Visual Studio 2022 或 Visual Studio 2022 Build Tools（安装时需勾选：使用 C++ 的桌面开发、MSVC v143 生成工具、Windows 10 或 Windows 11 SDK、C++ CMake 工具）
+3. NVIDIA CUDA Toolkit（包含nvcc、CUDA Runtime、CUDA 编译器和开发头文件）
+4. NVIDIA 显卡驱动
+
+使用方法：
+1. 安装好必要组件后启动 编译.cmd
+2. 启动 run.bat，输入所需参数后回车即可
