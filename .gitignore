@@ -68,3 +68,8 @@ Desktop.ini
 *.local
 *.local.*
 .env
+
+# ---------- 9. 个人笔记（仅本地，不公开）----------
+开发日志.txt
+个人笔记*.txt
+TODO*.txt
