@@ -1,0 +1,67 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    uint input_words[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer {
+    uint weight_words[];
+};
+
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    uint output_words[];
+};
+
+layout(push_constant) uniform Parameters {
+    uint elements;
+    float epsilon;
+} parameters;
+
+shared float scratch[256];
+
+float load_half_value(uint index) {
+    const vec2 values = unpackHalf2x16(input_words[index >> 1U]);
+    return (index & 1U) == 0U ? values.x : values.y;
+}
+
+float load_weight_half(uint index) {
+    const vec2 values = unpackHalf2x16(weight_words[index >> 1U]);
+    return (index & 1U) == 0U ? values.x : values.y;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    float sum_squares = 0.0;
+    for (uint i = tid; i < parameters.elements; i += 256U) {
+        const float value = load_half_value(i);
+        sum_squares += value * value;
+    }
+    scratch[tid] = sum_squares;
+    barrier();
+
+    for (uint stride = 128U; stride > 0U; stride >>= 1U) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        barrier();
+    }
+
+    const float inverse_rms = inversesqrt(
+        scratch[0] / float(parameters.elements) + parameters.epsilon);
+    const uint output_word_count = (parameters.elements + 1U) / 2U;
+    for (uint word_index = tid; word_index < output_word_count;
+         word_index += 256U) {
+        const uint first_index = word_index * 2U;
+        const uint second_index = first_index + 1U;
+        const float first = load_half_value(first_index) * inverse_rms *
+                            load_weight_half(first_index);
+        float second = 0.0;
+        if (second_index < parameters.elements) {
+            second = load_half_value(second_index) * inverse_rms *
+                     load_weight_half(second_index);
+        }
+        output_words[word_index] = packHalf2x16(vec2(first, second));
+    }
+}

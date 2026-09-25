@@ -5,6 +5,7 @@
 #include "citlali/model/linear_backend.h"
 #include "citlali/model/qwen_config.h"
 #include "citlali/model/weight_loader.h"
+#include "citlali/remote/remote_client.h"
 
 #include <cstdint>
 #include <memory>
@@ -34,7 +35,9 @@ namespace citlali::model
         public:
         QwenModel() = default; //空构造
 
-        void load(const io::GgufFile& gguf, uint32_t max_context = 0);
+        void load(const io::GgufFile& gguf, uint32_t max_context = 0,
+                  bool quantized = false,
+                  const remote::RemoteOptions& remote_options = {});
         // 加载模型
         int32_t forward_token(int32_t token_id, uint32_t position, bool compute_logits = true);
         // 单次生成一个 token 的完整前向传播
@@ -46,6 +49,9 @@ namespace citlali::model
         // 读取模型超参数、最大上下文长度
 
         private:
+        remote::RemoteOptions remote_options_;
+        std::unique_ptr<remote::RemoteClient> remote_client_;
+        std::vector<uint16_t> remote_input_;
         // 根据max_context分配KV缓存、中间计算临时显存
         void allocate_runtime_buffers();
         // 从最后一层logits中贪心采样，选出概率最大的token id

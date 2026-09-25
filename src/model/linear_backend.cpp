@@ -22,17 +22,42 @@ namespace citlali::model {
                          ) const override
             // 线性层的前向计算接口
             {
-                require(weight.storage_kind == compute::WeightStorageKind::Fp16Device,
-                        "only FP16 device weights are implemented by the first linear backend");
-                // 要求权重必须是fp16
                 require(input && output, "linear backend received a null buffer");
                 // 检查输入/输出缓冲区是否是空指针
-                compute::launch_matvec_fp16(weight.device_half_data(),
-                                            input->half_data(),
-                                            output->half_data(),
-                                            as_int(weight.cols(), weight.name + " cols"),
-                                            as_int(weight.rows(), weight.name + " rows"));
+                if (weight.storage_kind == compute::WeightStorageKind::QuantizedDevice)
+                {
+                    switch (weight.gguf_type)
+                    {
+                    case(compute::GgufTensorType::Q4_K):
+                        compute::launch_matvec_q4k(weight.device_quantized_data(),
+                                                    input->half_data(),
+                                                    output->half_data(),
+                                                    as_int(weight.cols(), weight.name + " cols"),
+                                                    as_int(weight.rows(), weight.name + " rows"));
+                        return;
+                    case(compute::GgufTensorType::Q6_K):
+                        compute::launch_matvec_q6k(weight.device_quantized_data(),
+                                                    input->half_data(),
+                                                    output->half_data(),
+                                                    as_int(weight.cols(), weight.name + " cols"),
+                                                    as_int(weight.rows(), weight.name + " rows"));
+                        return;
+                    default:
+                        throw Error("unsupported weight storage kind for: " + weight.name);
+                    }
+                }
+                else if (weight.storage_kind == compute::WeightStorageKind::Fp16Device){
+                    compute::launch_matvec_fp16(weight.device_half_data(),
+                                               input->half_data(),
+                                               output->half_data(),
+                                               as_int(weight.cols(), weight.name + " cols"),
+                                               as_int(weight.rows(), weight.name + " rows"));
+                }
                 // 启动 FP16 矩阵-向量乘法
+                else
+                {
+                   throw Error("unknown storage_kind");
+                }
             }
         };
 

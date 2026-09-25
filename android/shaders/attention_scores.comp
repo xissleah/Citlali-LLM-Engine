@@ -1,0 +1,40 @@
+#version 450
+
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0, std430) readonly buffer QueryBuffer { uint query_words[]; };
+layout(set = 0, binding = 1, std430) readonly buffer KeyCacheBuffer { uint key_words[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer ScoreBuffer { float scores[]; };
+layout(push_constant) uniform Parameters {
+    uint position; uint max_context; uint heads; uint kv_heads;
+    uint head_dim; float scale;
+} p;
+shared float scratch[128];
+
+float load_query(uint index) {
+    vec2 value = unpackHalf2x16(query_words[index >> 1U]);
+    return (index & 1U) == 0U ? value.x : value.y;
+}
+float load_key(uint index) {
+    vec2 value = unpackHalf2x16(key_words[index >> 1U]);
+    return (index & 1U) == 0U ? value.x : value.y;
+}
+
+void main() {
+    uint token = gl_WorkGroupID.x;
+    uint head = gl_WorkGroupID.y;
+    if (token > p.position || head >= p.heads) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint kv_head = head / (p.heads / p.kv_heads);
+    float sum = 0.0;
+    for (uint dim = tid; dim < p.head_dim; dim += 128U) {
+        sum += load_query(head * p.head_dim + dim) *
+               load_key((token * p.kv_heads + kv_head) * p.head_dim + dim);
+    }
+    scratch[tid] = sum;
+    barrier();
+    for (uint stride = 64U; stride > 0U; stride >>= 1U) {
+        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        barrier();
+    }
+    if (tid == 0U) scores[head * p.max_context + token] = scratch[0] * p.scale;
+}

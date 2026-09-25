@@ -124,6 +124,260 @@ namespace citlali::compute {
         }
         // 对 每个 attention head 单独执行 RMSNorm
 
+        __device__ float load_half_from_byte(const uint8_t *p)
+        {
+            uint16_t bits = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+            return __half2float(__ushort_as_half(bits));
+        }
+        // 从两个字节中读取一个fp16
+
+        __device__ float dequant_q6k_value(
+            const uint8_t* block,
+            int index
+        ) {
+            const uint8_t* ql = block;
+            const uint8_t* qh = block + 128;
+            const int8_t* scales =
+                reinterpret_cast<const int8_t*>(block + 192);
+
+            const float d = load_half_from_byte(block + 208);
+
+            const int half = index / 128;
+            const int in_half = index % 128;
+            const int part = in_half / 32;
+            const int i = in_half % 32;
+            const int scale_group = i / 16;
+
+            const uint8_t ql_byte =
+                ql[half * 64 + (part % 2) * 32 + i];
+
+            const uint8_t qh_byte =
+                qh[half * 32 + i];
+
+            const int low4 =
+                part < 2 ? (ql_byte & 0x0F) : (ql_byte >> 4);
+
+            const int high2 =
+                (qh_byte >> (part * 2)) & 0x03;
+
+            const int q =
+                (low4 | (high2 << 4)) - 32;
+
+            const int scale_index =
+                half * 8 + scale_group + part * 2;
+
+            return d
+                 * static_cast<float>(scales[scale_index])
+                 * static_cast<float>(q);
+        }
+
+        __device__ void get_q4k_scale_min(int j, const uint8_t* scales, uint8_t& scale, uint8_t& min)
+        {
+            if (j < 4)
+            {
+                scale = scales[j] & 0x3f;
+                min = scales[j+4] & 0x3f;
+            }
+            else
+            {
+                scale = (scales[j+4] & 0x0f) | ((scales[j-4] >> 6) << 4);
+                min = (scales[j+4] >> 4) | ((scales[j] >> 6) << 4);
+            }
+        }
+        // q4k 解析 scale 和 min
+        /*
+        Q4_K 有8个子组，每个子组包含32个量化值，每个子组对应scale[j] min[j]
+        但是 12 字节的 scales 中，scale/min 并不是简单地每个占一个字节，而是
+        - 低 6 位保存部分数据
+        - 高 2 位被压缩存放到其他字节中
+        */
+
+        __global__ void matvec_q4k_kernel(const uint8_t* weight, const uint16_t* input, uint16_t* output, int in_features)
+        {
+            constexpr int qk_k = 256;
+            constexpr int q4k_block_bytes = 144;
+
+            __shared__ float scratch[256];
+
+            const int row = blockIdx.x;
+            const int tid = threadIdx.x;
+            const int blocks_per_row = in_features / qk_k;
+
+            const uint8_t* row_weight = weight + static_cast<size_t>(row) * blocks_per_row * q4k_block_bytes;
+            float sum = 0.0f;
+
+            for (int block_id = 0; block_id < blocks_per_row; ++block_id)
+            {
+                const uint8_t* block = row_weight + block_id * q4k_block_bytes;
+
+                const float d_all = load_half_from_byte(block);
+                const float dmin_all = load_half_from_byte(block+2);
+                const uint8_t* scales = block + 4;
+                const uint8_t* qs = block + 16;
+
+                const int super = tid / 64;
+                const int offset = tid % 64;
+                const bool high = offset >= 32;
+                const int scale_index = super * 2 + (high ? 1 : 0);
+
+                uint8_t scale_code = 0;
+                uint8_t min_code = 0;
+                get_q4k_scale_min(scale_index, scales, scale_code, min_code);
+
+                const uint8_t packed = qs[super * 32 + (offset % 32)];
+                const int  q = high ? (packed >> 4) : (packed & 0x0f);
+
+                const float value = d_all * static_cast<float>(scale_code) * static_cast<float>(q) - dmin_all * static_cast<float>(min_code);
+
+                sum += value * load_half(input, block_id * qk_k + tid);
+            }
+
+            scratch[tid] = sum;
+            __syncthreads();
+
+            for (int  stride = 128; stride > 0; stride >>= 1)
+            {
+                if (tid < stride)
+                {
+                    scratch[tid] += scratch[tid + stride];
+                }
+                __syncthreads();
+            }
+
+            if (tid==0)
+            {
+                store_half(output, row, scratch[0]);
+            }
+        }
+
+        __global__ void matvec_q6k_kernel(const uint8_t* weight, const uint16_t* input, uint16_t *output, int in_features)
+        {
+            constexpr int qk_k = 256;
+            constexpr int q6k_block_bytes = 210;
+
+            __shared__ float scratch[256];
+
+            const int row = blockIdx.x;
+            const int tid = threadIdx.x;
+            const int blocks_per_row = in_features / qk_k;
+            float sum = 0.0f;
+            const uint8_t* row_weight = weight + static_cast<size_t>(row) * blocks_per_row * q6k_block_bytes;
+
+            for (int block_id = 0; block_id < blocks_per_row; ++block_id)
+            {
+                const uint8_t* block = row_weight + block_id * q6k_block_bytes;
+
+                const float value = dequant_q6k_value(block, tid);
+
+                sum +=  value * load_half(input, block_id * qk_k + tid);
+            }
+
+            scratch[tid] = sum;
+            __syncthreads();
+
+            for (int stride = 128; stride > 0; stride >>= 1)
+            {
+                if (tid < stride)
+                {
+                    scratch[tid] += scratch[tid + stride];
+                }
+                __syncthreads();
+            }
+
+            if (tid == 0)
+            {
+                store_half(output, row, scratch[0]);
+            }
+        }
+
+        __global__ void matvec_q6k_to_float_kernel(const uint8_t* weight, const uint16_t* input, float* output, int in_features)
+        {
+            constexpr int QK_K = 256;
+            constexpr int Q6K_BLOCK_BYTES = 210;
+
+            __shared__ float scratch[256];
+
+            const int row = blockIdx.x;
+            const int tid = threadIdx.x;
+            const int blocks_per_row = in_features / QK_K;
+
+            const uint8_t* row_weight =
+                weight
+                + static_cast<size_t>(row)
+                * blocks_per_row
+                * Q6K_BLOCK_BYTES;
+
+            float sum = 0.0f;
+
+            for (int block_id = 0; block_id < blocks_per_row; ++block_id) {
+                const uint8_t* block =
+                    row_weight + block_id * Q6K_BLOCK_BYTES;
+
+                const float value =
+                    dequant_q6k_value(block, tid);
+
+                sum += value * load_half(
+                    input,
+                    block_id * QK_K + tid
+                );
+            }
+
+            scratch[tid] = sum;
+            __syncthreads();
+
+            for (int stride = 128; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    scratch[tid] += scratch[tid + stride];
+                }
+                __syncthreads();
+            }
+
+            if (tid == 0) {
+                output[row] = scratch[0];
+            }
+        }
+
+        __global__ void embed_q6k_kernel(
+            const uint8_t* embedding,
+            int32_t token_id,
+            uint16_t* output,
+            int hidden
+        ) {
+            constexpr int QK_K = 256;
+            constexpr int Q6K_BLOCK_BYTES = 210;
+
+            const int index =
+                blockIdx.x * blockDim.x + threadIdx.x;
+
+            if (index >= hidden) {
+                return;
+            }
+
+            const int blocks_per_row =
+                hidden / QK_K;
+
+            const uint8_t* token_row =
+                embedding
+                + static_cast<size_t>(token_id)
+                * blocks_per_row
+                * Q6K_BLOCK_BYTES;
+
+            const int block_id =
+                index / QK_K;
+
+            const int block_index =
+                index % QK_K;
+
+            const uint8_t* block =
+                token_row + block_id * Q6K_BLOCK_BYTES;
+
+            const float value =
+                dequant_q6k_value(block, block_index);
+
+            store_half(output, index, value);
+        }
+        // 从 Q6_K 量化的 embedding 矩阵中读取一个 token 对应的行，并将其动态反量化为 FP16
+
         __global__ void matvec_fp16_kernel(const uint16_t* weight, const uint16_t* input, uint16_t* output, int in_features) {
             // output = weight × input
             __shared__ float scratch[256];
@@ -413,6 +667,22 @@ namespace citlali::compute {
     }
     // 启动一个 CUDA kernel，把某个 token 对应的 embedding 向量复制到 out
 
+    void launch_embed_q6k(const uint8_t* embedding, int32_t token_id, uint16_t* output, int hidden)
+    {
+        constexpr int block = 256;
+        const int grid = (hidden + block - 1) / block;
+
+        embed_q6k_kernel<<<grid, block>>>(
+            embedding,
+            token_id,
+            output,
+            hidden
+        );
+
+        CITLALI_CUDA_CHECK(cudaGetLastError());
+    }
+    // 从 Q6_K 量化的 embedding 矩阵中读取一个 token 对应的行，并将其动态反量化为 FP16
+
     void launch_copy(const uint16_t* input, uint16_t* output, int n) {
         /*
         input  输入数组
@@ -498,6 +768,33 @@ namespace citlali::compute {
         CITLALI_CUDA_CHECK(cudaGetLastError());
     }
     // 和上面那个基本相同，区别是 输入和权重使用 FP16 存储，输出使用 float 存储
+
+    void launch_matvec_q4k(const uint8_t* weight, const uint16_t* input, uint16_t* output, int in_features, int out_features)
+    {
+        matvec_q4k_kernel<<<out_features,256>>>(weight, input, output, in_features);
+        CITLALI_CUDA_CHECK(cudaGetLastError());
+    }
+    // 权重为q4k
+
+    void launch_matvec_q6k(const uint8_t* weight, const uint16_t* input, uint16_t* output, int in_features, int out_features)
+    {
+        matvec_q6k_kernel<<<out_features, 256>>>(weight, input, output, in_features);
+        CITLALI_CUDA_CHECK(cudaGetLastError());
+    }
+    // 权重为q6k
+
+    void launch_matvec_q6k_to_float(const uint8_t* weight, const uint16_t* input, float* output, int in_features, int out_features)
+    {
+        matvec_q6k_to_float_kernel<<<out_features, 256>>>(
+            weight,
+            input,
+            output,
+            in_features
+        );
+
+        CITLALI_CUDA_CHECK(cudaGetLastError());
+    }
+
 
     void launch_swiglu(const uint16_t* gate, const uint16_t* up, uint16_t* output, int n) {
         /*

@@ -11,10 +11,7 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
-/*
-v0.1改进：
-forward_token 新增bool参数 compute_logits，从原先每个token都要计算logits转变为仅最后一个prompt token计算logits
-*/
+
 namespace citlali::model {
     namespace {
 
@@ -45,16 +42,28 @@ namespace citlali::model {
         // 如果某个层存在 bias，就把 bias 加到目标张量 target 上，如果没有 bias，则什么也不做
     }
 
-    void QwenModel::load(const io::GgufFile& gguf, uint32_t max_context) {
+    void QwenModel::load(const io::GgufFile& gguf, uint32_t max_context,
+                         bool quantized,
+                         const remote::RemoteOptions& remote_options) {
         config_ = QwenConfig::from_gguf(gguf);
+        remote_options_ = remote_options;
         // 读取模型配置
         max_context_ = max_context == 0 ? std::min<uint32_t>(config_.context_length, 2048) : std::min(max_context, config_.context_length);
         // 最大上下文
         require(max_context_ > 0, "max_context must be positive");
 
-        WeightLoader loader(gguf, WeightLoadPolicy::DequantizeToFp16);
+        WeightLoader loader(gguf, quantized?WeightLoadPolicy::KeepQuantized:WeightLoadPolicy::DequantizeToFp16);
         linear_backend_ = make_fp16_linear_backend();
-        // 创建权重加载器和fp16计算后端
+        remote_client_.reset();
+        if (remote_options_.enabled()) {
+            for (const uint32_t layer_index : remote_options_.layers) {
+                require(layer_index < config_.block_count,
+                        "remote layer index is out of range: " +
+                        std::to_string(layer_index));
+            }
+            remote_client_ = std::make_unique<remote::RemoteClient>(remote_options_);
+        }
+        // 创建权重加载器和fp16计算后端，支持保持量化
 
         std::cerr << "Loading token embedding...\n";
         token_embedding_ = loader.load_required("token_embd.weight");
@@ -89,6 +98,8 @@ namespace citlali::model {
             // 逐层加载
             std::cerr << "Loading layer " << (i + 1) << "/" << config_.block_count << "\n";
             auto& layer = layers_[i];
+            const bool remote_layer = remote_options_.offloads_layer(i);
+            if (!remote_layer) {
             layer.attn_norm = loader.load_required(layer_name(i, "attn_norm.weight"));
             // 注意力前的归一化权重
             layer.attn_q = loader.load_required(layer_name(i, "attn_q.weight"));
@@ -105,8 +116,31 @@ namespace citlali::model {
             // 注意力输出投影权重及其偏置
             layer.attn_q_norm = loader.load_optional(layer_name(i, "attn_q_norm.weight"));
             layer.attn_k_norm = loader.load_optional(layer_name(i, "attn_k_norm.weight"));
+            } else {
+                require(gguf.find_tensor(layer_name(i, "attn_q.bias")) == nullptr &&
+                        gguf.find_tensor(layer_name(i, "attn_k.bias")) == nullptr &&
+                        gguf.find_tensor(layer_name(i, "attn_v.bias")) == nullptr &&
+                        gguf.find_tensor(layer_name(i, "attn_output.bias")) == nullptr &&
+                        gguf.find_tensor(layer_name(i, "ffn_gate.bias")) == nullptr &&
+                        gguf.find_tensor(layer_name(i, "ffn_up.bias")) == nullptr &&
+                        gguf.find_tensor(layer_name(i, "ffn_down.bias")) == nullptr,
+                        "remote layer v1 does not support bias tensors");
+                layer.attn_norm = loader.load_remote_required(layer_name(i, "attn_norm.weight"));
+                layer.attn_q = loader.load_remote_required(layer_name(i, "attn_q.weight"));
+                layer.attn_k = loader.load_remote_required(layer_name(i, "attn_k.weight"));
+                layer.attn_v = loader.load_remote_required(layer_name(i, "attn_v.weight"));
+                layer.attn_o = loader.load_remote_required(layer_name(i, "attn_output.weight"));
+                layer.attn_q_norm = loader.load_remote_required(layer_name(i, "attn_q_norm.weight"));
+                layer.attn_k_norm = loader.load_remote_required(layer_name(i, "attn_k_norm.weight"));
+                layer.ffn_norm = loader.load_remote_required(layer_name(i, "ffn_norm.weight"));
+                layer.ffn_gate = loader.load_remote_required(layer_name(i, "ffn_gate.weight"));
+                layer.ffn_up = loader.load_remote_required(layer_name(i, "ffn_up.weight"));
+                layer.ffn_down = loader.load_remote_required(layer_name(i, "ffn_down.weight"));
+                remote_client_->upload_layer(gguf, i);
+            }
             // 这是对每个 Query/Key 头进行额外归一化的权重，属于可选项
-            layer.ffn_norm = loader.load_required(layer_name(i, "ffn_norm.weight"));
+            if (!remote_layer) {
+                layer.ffn_norm = loader.load_required(layer_name(i, "ffn_norm.weight"));
             // 前馈神经网络之前的归一化权重
             layer.ffn_gate = loader.load_required(layer_name(i, "ffn_gate.weight"));
             layer.ffn_gate_bias = loader.load_optional(layer_name(i, "ffn_gate.bias"));
@@ -115,7 +149,8 @@ namespace citlali::model {
             layer.ffn_up_bias = loader.load_optional(layer_name(i, "ffn_up.bias"));
             // up分支的权重及其偏置
             layer.ffn_down = loader.load_required(layer_name(i, "ffn_down.weight"));
-            layer.ffn_down_bias = loader.load_optional(layer_name(i, "ffn_down.bias"));
+                layer.ffn_down_bias = loader.load_optional(layer_name(i, "ffn_down.bias"));
+            }
             // down分支的权重及其偏置
 
             require_shape(layer.attn_norm, hidden, 1);
@@ -138,12 +173,15 @@ namespace citlali::model {
             if (layer.ffn_down_bias.buffer) require_shape(layer.ffn_down_bias, hidden, 1);
             // 检查每层权重的形状
 
-            layer.k_cache = compute::make_device_half_buffer(static_cast<size_t>(max_context_) * static_cast<size_t>(kv_size));
-            layer.v_cache = compute::make_device_half_buffer(static_cast<size_t>(max_context_) * static_cast<size_t>(kv_size));
+            if (!remote_layer) {
+                layer.k_cache = compute::make_device_half_buffer(static_cast<size_t>(max_context_) * static_cast<size_t>(kv_size));
+                layer.v_cache = compute::make_device_half_buffer(static_cast<size_t>(max_context_) * static_cast<size_t>(kv_size));
+            }
             // 为每层创建KV cache
         }
 
         allocate_runtime_buffers();
+        remote_input_.resize(static_cast<size_t>(hidden));
         // 分配运行时临时缓冲区
     }
     // 从 GGUF 模型文件中读取 Qwen 模型的配置和权重，检查形状，创建每一层的 KV Cache，最后分配推理时需要的临时缓冲区
@@ -215,7 +253,19 @@ namespace citlali::model {
         const int ff = as_int(config_.feed_forward_length, "feed_forward_length");
         // FFN 中间层维度
 
-        compute::launch_embed(token_embedding_.device_half_data(), token_id, x_->half_data(), hidden);
+        if (token_embedding_.storage_kind == compute::WeightStorageKind::QuantizedDevice)
+        {
+            if (token_embedding_.gguf_type ==compute::GgufTensorType::Q6_K) {
+                compute::launch_embed_q6k(token_embedding_.device_quantized_data(), token_id, x_->half_data(), hidden);
+            }
+            else {
+                throw Error("unsupported quantized embedding type");
+            }
+        }
+        else
+        {
+            compute::launch_embed(token_embedding_.device_half_data(), token_id, x_->half_data(), hidden);
+        }
         // token ID -> 向量，这一步从 embedding 矩阵中取出 token_id 对应的向量，写入 x_
         /*
         GPU 上的 embedding 权重
@@ -225,7 +275,33 @@ namespace citlali::model {
         GPU 上的 x_，长度为 hidden
         */
 
-        for (auto& layer : layers_) {
+        for (std::size_t layer_index = 0; layer_index < layers_.size(); ++layer_index) {
+            auto& layer = layers_[layer_index];
+            if (remote_options_.offloads_layer(static_cast<uint32_t>(layer_index))) {
+                std::size_t last_remote_layer = layer_index;
+                while (last_remote_layer + 1 < layers_.size() &&
+                       remote_options_.offloads_layer(
+                           static_cast<uint32_t>(last_remote_layer + 1))) {
+                    ++last_remote_layer;
+                }
+                x_->copy_to_host(remote_input_.data(),
+                                 remote_input_.size() * sizeof(uint16_t));
+                const std::vector<uint16_t> remote_output =
+                    remote_client_->run_layer_range(
+                    static_cast<uint32_t>(layer_index),
+                    static_cast<uint32_t>(last_remote_layer), position,
+                    max_context_, remote_input_, static_cast<uint32_t>(ff),
+                    static_cast<uint32_t>(heads),
+                    static_cast<uint32_t>(kv_heads),
+                    static_cast<uint32_t>(head_dim), config_.rms_norm_eps,
+                    config_.rope_theta);
+                require(remote_output.size() == static_cast<size_t>(hidden),
+                        "remote layer returned an unexpected hidden size");
+                x_->copy_from_host(remote_output.data(),
+                                   remote_output.size() * sizeof(uint16_t));
+                layer_index = last_remote_layer;
+                continue;
+            }
             // 逐层执行transformer
             compute::launch_rms_norm(x_->half_data(), layer.attn_norm.device_half_data(), norm_->half_data(), hidden, config_.rms_norm_eps);
             /*
@@ -302,15 +378,41 @@ namespace citlali::model {
         if (!compute_logits) {
             return -1;
         }
-        // v0.1改进：如果当前token是中间token时，这个预测结果很快会被下一个token覆盖，所以只需要最后一个prompt token才需要计算logits
+        // 如果当前token是中间token时，这个预测结果很快会被下一个token覆盖，所以只需要最后一个prompt token才需要计算logits
 
         compute::launch_rms_norm(x_->half_data(), output_norm_.device_half_data(), norm_->half_data(), hidden, config_.rms_norm_eps);
         // 所有层完成后得到最终隐藏状态，再对其进行RMSNorm
-        compute::launch_matvec_fp16_to_float(output_weight_.device_half_data(),
-                                             norm_->half_data(),
-                                             static_cast<float*>(logits_->data()),
-                                             hidden,
-                                             as_int(config_.vocab_size, "vocab_size"));
+        if (output_weight_.storage_kind == compute::WeightStorageKind::QuantizedDevice)
+        {
+
+            switch (output_weight_.gguf_type) {
+            case compute::GgufTensorType::Q6_K:
+                compute::launch_matvec_q6k_to_float(
+                    output_weight_.device_quantized_data(),
+                    norm_->half_data(),
+                    static_cast<float*>(logits_->data()),
+                    hidden,
+                    as_int(config_.vocab_size, "vocab_size")
+                );
+                break;
+
+            default:
+                throw Error(
+                    "unsupported quantized output weight type: "
+                    + compute::to_string(output_weight_.gguf_type)
+                );
+            }
+        }
+        else
+        {
+            compute::launch_matvec_fp16_to_float(
+                output_weight_.device_half_data(),
+                norm_->half_data(),
+                static_cast<float*>(logits_->data()),
+                hidden,
+                as_int(config_.vocab_size, "vocab_size")
+            );
+        }
         // 这一步将隐藏向量映射到整个词表 logits = output_weight(权重) × norm_(输入) -> logits_每一个词表 token 都得到一个分数
         return sample_greedy_from_logits();
         // 贪心采样并返回结果

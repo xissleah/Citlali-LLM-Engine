@@ -1,0 +1,42 @@
+#version 450
+
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer { uint input_words[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer { uint weight_words[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer { uint output_words[]; };
+layout(push_constant) uniform Parameters { uint heads; uint head_dim; float epsilon; } p;
+shared float scratch[256];
+
+float load_input(uint index) {
+    vec2 value = unpackHalf2x16(input_words[index >> 1U]);
+    return (index & 1U) == 0U ? value.x : value.y;
+}
+float load_weight(uint index) {
+    vec2 value = unpackHalf2x16(weight_words[index >> 1U]);
+    return (index & 1U) == 0U ? value.x : value.y;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint head = gl_WorkGroupID.x;
+    uint base = head * p.head_dim;
+    float sum = 0.0;
+    for (uint i = tid; i < p.head_dim; i += 256U) {
+        float value = load_input(base + i);
+        sum += value * value;
+    }
+    scratch[tid] = sum;
+    barrier();
+    for (uint stride = 128U; stride > 0U; stride >>= 1U) {
+        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        barrier();
+    }
+    float inverse_rms = inversesqrt(scratch[0] / float(p.head_dim) + p.epsilon);
+    for (uint word = tid; word < (p.head_dim + 1U) / 2U; word += 256U) {
+        uint i0 = word * 2U;
+        uint i1 = i0 + 1U;
+        float a = load_input(base + i0) * inverse_rms * load_weight(i0);
+        float b = i1 < p.head_dim ? load_input(base + i1) * inverse_rms * load_weight(i1) : 0.0;
+        output_words[(base >> 1U) + word] = packHalf2x16(vec2(a, b));
+    }
+}

@@ -1,0 +1,114 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer WeightBuffer {
+    uint weight_words[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputBuffer {
+    uint input_words[];
+};
+
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    uint output_words[];
+};
+
+layout(push_constant) uniform Parameters {
+    uint in_features;
+    uint out_features;
+} parameters;
+
+shared float scratch[256];
+shared uint row_half_bits[2];
+
+uint load_byte(uint byte_offset) {
+    const uint word = weight_words[byte_offset >> 2U];
+    return (word >> ((byte_offset & 3U) * 8U)) & 0xffU;
+}
+
+float load_half_from_weight(uint byte_offset) {
+    const uint bits = load_byte(byte_offset) |
+                      (load_byte(byte_offset + 1U) << 8U);
+    return unpackHalf2x16(bits).x;
+}
+
+float load_input_half(uint index) {
+    const uint packed = input_words[index >> 1U];
+    const vec2 values = unpackHalf2x16(packed);
+    return (index & 1U) == 0U ? values.x : values.y;
+}
+
+void get_scale_min(uint index, uint scales_offset,
+                   out uint scale_code, out uint min_code) {
+    if (index < 4U) {
+        scale_code = load_byte(scales_offset + index) & 0x3fU;
+        min_code = load_byte(scales_offset + index + 4U) & 0x3fU;
+    } else {
+        scale_code =
+            (load_byte(scales_offset + index + 4U) & 0x0fU) |
+            ((load_byte(scales_offset + index - 4U) >> 6U) << 4U);
+        min_code =
+            (load_byte(scales_offset + index + 4U) >> 4U) |
+            ((load_byte(scales_offset + index) >> 6U) << 4U);
+    }
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint blocks_per_row = parameters.in_features / 256U;
+
+    for (uint row_in_pair = 0U; row_in_pair < 2U; ++row_in_pair) {
+        const uint row = gl_WorkGroupID.x * 2U + row_in_pair;
+        float sum = 0.0;
+        if (row < parameters.out_features) {
+            const uint row_offset = row * blocks_per_row * 144U;
+            for (uint block_id = 0U; block_id < blocks_per_row; ++block_id) {
+                const uint block_offset = row_offset + block_id * 144U;
+                const float d_all = load_half_from_weight(block_offset);
+                const float dmin_all = load_half_from_weight(block_offset + 2U);
+                const uint scales_offset = block_offset + 4U;
+                const uint quants_offset = block_offset + 16U;
+
+                const uint super_group = tid / 64U;
+                const uint offset = tid % 64U;
+                const bool high = offset >= 32U;
+                const uint scale_index =
+                    super_group * 2U + (high ? 1U : 0U);
+
+                uint scale_code = 0U;
+                uint min_code = 0U;
+                get_scale_min(scale_index, scales_offset, scale_code, min_code);
+
+                const uint packed = load_byte(
+                    quants_offset + super_group * 32U + (offset % 32U));
+                const uint quant = high ? (packed >> 4U) : (packed & 0x0fU);
+                const float value =
+                    d_all * float(scale_code) * float(quant) -
+                    dmin_all * float(min_code);
+                sum += value * load_input_half(block_id * 256U + tid);
+            }
+        }
+
+        scratch[tid] = sum;
+        barrier();
+
+        for (uint stride = 128U; stride > 0U; stride >>= 1U) {
+            if (tid < stride) {
+                scratch[tid] += scratch[tid + stride];
+            }
+            barrier();
+        }
+
+        if (tid == 0U) {
+            row_half_bits[row_in_pair] =
+                packHalf2x16(vec2(scratch[0], 0.0)) & 0xffffU;
+        }
+        barrier();
+    }
+
+    if (tid == 0U) {
+        output_words[gl_WorkGroupID.x] =
+            row_half_bits[0] | (row_half_bits[1] << 16U);
+    }
+}

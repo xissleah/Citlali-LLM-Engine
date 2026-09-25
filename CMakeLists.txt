@@ -23,6 +23,7 @@ add_library(citlali_engine STATIC
     src/model/linear_backend.cpp
     src/model/qwen_model.cpp
     src/runtime/session.cpp
+    src/remote/remote_client.cpp
     src/compute/cuda/tensor.cu
     src/compute/cuda/kernels.cu
         include/citlali/compute/common/dtype.h
@@ -36,6 +37,10 @@ target_include_directories(citlali_engine PUBLIC
 )
 
 target_link_libraries(citlali_engine PUBLIC CUDA::cudart)
+
+if(WIN32)
+    target_link_libraries(citlali_engine PUBLIC ws2_32)
+endif()
 
 target_compile_definitions(citlali_engine PUBLIC NOMINMAX)
 

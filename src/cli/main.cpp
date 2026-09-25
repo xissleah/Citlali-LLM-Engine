@@ -24,14 +24,16 @@
 namespace {
 
 struct CliArgs {
-    std::string model_path = "C:\\work\\citlali\\Qwen3-0.6B-Q4_K_M.gguf";
-    std::string prompt;
-    uint32_t max_new_tokens = 256;
-    uint32_t max_context = 2048;
-    bool chat = true;
-    bool interactive = false;
-    bool info = false;
-    bool tokens = false;
+    std::string model_path = "";            // 模型路径
+    std::string prompt;                     // 提示词
+    uint32_t max_new_tokens = 256;          // 默认每次最多产出256新toekn
+    uint32_t max_context = 2048;            // 默认最长上下文2048
+    bool chat = true;                       // 是否套聊天模板
+    bool interactive = false;               // 交互模式
+    bool info = false;                      // 打印模型消息
+    bool tokens = false;                    // 打印分词结果
+    bool quantized = false;                 // 是否开启量化模式
+    citlali::remote::RemoteOptions remote;  // 是否开启异构计算
 };
 
 void print_usage() {
@@ -51,30 +53,67 @@ void print_usage() {
               << "  --no-chat-template      Treat --prompt as raw text\n"
               << "  --interactive           Multi-turn CLI chat\n"
               << "  --info                  Print GGUF/config summary without loading weights\n"
-              << "  --tokens                Print prompt tokenization without loading weights\n";
+              << "  --tokens                Print prompt tokenization without loading weights\n"
+              << "  --quantized             Choose the quantized mode\n";
+    std::cout << "  --remote <host:port>    Remote device endpoint (USB adb forward uses 127.0.0.1)\n"
+              << "  --remote-transport <usb|wifi6>  Communication transport, default usb\n"
+              << "  --remote-backend <gpu|npu|hybrid|auto>\n"
+              << "  --offload <layer:N[,N]>  Whole-layer offload, for example layer:0,1\n";
 }
+    // 纯帮助文本
+
+void parse_offload(const std::string& value, citlali::remote::RemoteOptions& remote) {
+    const bool whole_layer = value.rfind("layer:", 0) == 0;
+    // 从位置0开始寻找“layer:”
+    constexpr std::size_t prefix_bytes = 6;
+    // 前缀长度常量。“layer:”长度为6
+    if (!whole_layer || value.size() <= prefix_bytes) {
+        throw std::runtime_error("--offload accepts layer:N[,N]");
+    }
+    // 格式不合法
+    std::stringstream stream(value.substr(prefix_bytes));
+    // 去除前缀后面的部分，准备切分
+    std::string item;
+    while (std::getline(stream, item, ',')) {
+        if (item.empty()) {
+            throw std::runtime_error("empty FFN layer in --offload");
+        }
+        // 都选择分摊了层数自然不能是0咯
+        const uint32_t layer = static_cast<uint32_t>(std::stoul(item));
+        // 把要分摊的每一层的序号转成u32并push到remote.layer里
+        remote.layers.push_back(layer);
+    }
+}
+    // 解析offloed，也就是异构分摊多少层
 
 std::string escaped_piece(const std::string& piece) {
     std::ostringstream out;
     for (unsigned char c : piece) {
+        // 使用unsigned char是因为后面第 c < 0x20 和 c == 0x7f 的比较、以及 static_cast<int>(c) 打印都要求 0~255 无符号值才正确
+        // 同时用uc遍历的话，每个字节按0~255处理，高位字节和ascii字符都能够正确判断
         switch (c) {
             case '\\n': out << "\\\\n"; break;
             case '\\r': out << "\\\\r"; break;
             case '\\t': out << "\\\\t"; break;
             case '\\"': out << "\\\\\""; break;
             case '\\\\': out << "\\\\\\\\"; break;
+            // 显式转义4个常见控制字符
             default:
                 if (c < 0x20 || c == 0x7f) {
                     out << "\\\\x" << std::uppercase << std::hex << std::setw(2) << std::setfill('0')
                         << static_cast<int>(c) << std::dec << std::nouppercase;
-                } else {
+                }
+            // 防止打印控制字符，其中0x7F是DEL
+                else {
                     out << static_cast<char>(c);
                 }
+            // 可打印的字符转为char并加入out流
                 break;
         }
     }
     return out.str();
 }
+    // 把一个 token 的原始字节文本，转成可安全打印、可一眼看懂控制字符的转义形式
 
 void print_prompt_tokens(const std::string& model_path, const std::string& prompt, bool chat) {
     citlali::io::GgufFile gguf;
@@ -180,9 +219,46 @@ CliArgs parse_args(const std::vector<std::string>& argv) {
         } else if (arg == "--help" || arg == "-h") {
             print_usage();
             std::exit(0);
-        } else {
+        } else if (arg == "--quantized"){
+            args.quantized = true;
+        } else if (arg == "--remote") {
+            args.remote.endpoint = need_value(arg);
+        } else if (arg == "--remote-transport") {
+            const std::string transport = need_value(arg);
+            if (transport == "usb") {
+                args.remote.transport = citlali::remote::Transport::Usb;
+            } else if (transport == "wifi6") {
+                args.remote.transport = citlali::remote::Transport::Wifi6;
+            } else {
+                throw std::runtime_error(
+                    "--remote-transport must be usb or wifi6");
+            }
+        } else if (arg == "--remote-backend") {
+            const std::string backend = need_value(arg);
+            if (backend == "gpu") args.remote.backend = citlali::remote::Backend::Gpu;
+            else if (backend == "npu") args.remote.backend = citlali::remote::Backend::Npu;
+            else if (backend == "hybrid") args.remote.backend = citlali::remote::Backend::Hybrid;
+            else if (backend == "auto") args.remote.backend = citlali::remote::Backend::Auto;
+            else throw std::runtime_error("--remote-backend must be gpu, npu, hybrid or auto");
+        } else if (arg == "--offload") {
+            parse_offload(need_value(arg), args.remote);
+        }else {
             throw std::runtime_error("unknown argument: " + arg);
         }
+    }
+    const bool has_offload = !args.remote.layers.empty();
+    if (has_offload && args.remote.endpoint.empty() &&
+        args.remote.transport == citlali::remote::Transport::Usb) {
+        args.remote.endpoint = "127.0.0.1:27183";
+    }
+    if (has_offload &&
+        args.remote.transport == citlali::remote::Transport::Wifi6 &&
+        args.remote.endpoint.empty()) {
+        throw std::runtime_error(
+            "wifi6 transport requires an endpoint; the launcher configures a wireless ADB tunnel automatically");
+    }
+    if (args.remote.endpoint.empty() != !has_offload) {
+        throw std::runtime_error("--remote and --offload must be used together");
     }
     return args;
 }
@@ -227,7 +303,8 @@ int run_cli(const std::vector<std::string>& argv) {
         }
 
         citlali::runtime::InferenceSession session;
-        session.load_model(args.model_path, args.max_context);
+        session.load_model(args.model_path, args.max_context, args.quantized,
+                           args.remote);
 
         if (args.interactive) {
             std::cout << "Citlali CUDA chat. Type /exit to quit, /reset to clear history.\n";

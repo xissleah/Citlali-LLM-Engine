@@ -4,16 +4,15 @@
 
 #include <algorithm>
 #include <iostream>
-/*
-v0.1改进：
-forward_token 新增bool参数 compute_logits，从原先每个token都要计算logits转变为仅最后一个prompt token计算logits
-*/
+
 namespace citlali::runtime {
-    void InferenceSession::load_model(const std::string& model_path, uint32_t max_context){
+    void InferenceSession::load_model(
+        const std::string& model_path, uint32_t max_context, bool quantized,
+        const remote::RemoteOptions& remote_options) {
         std::cerr << "Reading GGUF: " << model_path << std::endl;
         gguf_.load(model_path);
         tokenizer_.load_from_gguf(gguf_);
-        model_.load(gguf_, max_context);
+        model_.load(gguf_, max_context, quantized, remote_options);
         history_.clear();
         // 初始化
         std::cerr << "Model loaded. vocab=" << config().vocab_size

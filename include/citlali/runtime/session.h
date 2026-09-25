@@ -36,7 +36,10 @@ namespace citlali::runtime
     class InferenceSession
     {
         public:
-            void load_model(const std::string& model_path, uint32_t max_context = 2048);
+            void load_model(const std::string& model_path,
+                            uint32_t max_context = 2048,
+                            bool quantized = false,
+                            const remote::RemoteOptions& remote_options = {});
             std::string generate_once(const std::string& prompt, const GenerationOptions& options, const std::function<void(const std::string&)>& on_token = {});
             std::string chat_once(const std::string& user_message, const GenerationOptions& options, const std::function<void(const std::string&)>& on_token = {});
             GenerationResult generate_once_result(const std::string& prompt, const GenerationOptions& options, const std::function<void(const std::string&)>& on_token = {});

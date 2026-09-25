@@ -33,8 +33,12 @@ namespace citlali::model
 
         // const只读对象调用，返回只读FP16显存指针
         const uint16_t* device_half_data() const { return buffer ? buffer->half_data() : nullptr; }
-        // 普通对象调用，可读写显存FP16数据
+        // 普通对象调用，可读写显存FP16数据，这里重名不是错误，而是可以根据参数类型来自动选择的
         uint16_t* device_half_data() { return buffer ? buffer->half_data() : nullptr; }
+        // 只读量化
+        const uint8_t* device_quantized_data() const { return buffer ? static_cast<uint8_t*>(buffer->data()) : nullptr; }
+        // 可写量化
+        uint8_t* device_quantized_data() { return buffer ? static_cast<uint8_t*>(buffer->data()) : nullptr; }
     };
 
     class WeightLoader
@@ -43,6 +47,7 @@ namespace citlali::model
         explicit WeightLoader(const io::GgufFile& gguf, WeightLoadPolicy policy = WeightLoadPolicy::DequantizeToFp16);
         // 接收已经解析完成的 GGUF 文件只读引用以及加载策略
         WeightHandle load_required(const std::string& name) const;
+        WeightHandle load_remote_required(const std::string& name) const;
         // 加载必须权重
         WeightHandle load_optional(const std::string& name) const;
         // 加载可选权重

@@ -340,18 +340,45 @@ namespace citlali::model
         ) : gguf_(gguf), policy_(policy) {}
     // WeightLoader 的构造函数: 创建一个 WeightLoader 对象，并初始化它的两个成员变量gguf_和policy_
 
+    bool check_quantized_type(compute::GgufTensorType type)
+    {
+        switch (type)
+        {
+        case(compute::GgufTensorType::Q2_K):
+            return true;
+        case(compute::GgufTensorType::Q3_K):
+            return true;
+        case(compute::GgufTensorType::Q4_0):
+            return true;
+        case(compute::GgufTensorType::Q4_1):
+            return true;
+        case(compute::GgufTensorType::Q4_K):
+            return true;
+        case(compute::GgufTensorType::Q5_0):
+            return true;
+        case(compute::GgufTensorType::Q5_1):
+            return true;
+        case(compute::GgufTensorType::Q5_K):
+            return true;
+        case(compute::GgufTensorType::Q6_K):
+            return true;
+        case(compute::GgufTensorType::Q8_0):
+            return true;
+        case(compute::GgufTensorType::Q8_1):
+            return true;
+        case(compute::GgufTensorType::Q8_K):
+            return true;
+        default:
+            return false;
+        }
+    }
+    // 量化模式的辅助函数，这里其实写if然后用||就可以了，我写完后想起来可以不这么一个个case去写，算了写都写了
+
     WeightHandle WeightLoader::load_required(const std::string& name) const {
         const auto* tensor = gguf_.find_tensor(name);
         // 根据传入的名称查找 GGUF 文件中的张量
         require(tensor != nullptr, "missing required tensor: " + name);
 
-        if (policy_ == WeightLoadPolicy::KeepQuantized) {
-            throw Error("KeepQuantized policy is reserved for the later dynamic-dequant CUDA backend");
-        }
-        // 不允许保持量化格式
-
-        std::vector<uint16_t> host = load_as_fp16(*tensor);
-        // 将 tensor 转换为 FP16
         WeightHandle handle;
         // 这是一个权重句柄，用于保存权重的元数据和 GPU 缓冲区
         handle.name = name;
@@ -359,8 +386,38 @@ namespace citlali::model
         handle.storage_kind = compute::WeightStorageKind::Fp16Device;
         handle.dims = tensor->dims;
         handle.element_count = tensor->element_count();
-        handle.buffer = compute::make_device_half_buffer(static_cast<size_t>(handle.element_count));
-        handle.buffer->copy_from_host(host.data(), host.size() * sizeof(uint16_t));
+
+        if (policy_ == WeightLoadPolicy::KeepQuantized && check_quantized_type(tensor->type)) {
+            const std::vector<uint8_t> host = gguf_.read_tensor_bytes(*tensor);
+            // 读取张量
+            handle.storage_kind = compute::WeightStorageKind::QuantizedDevice;
+            // 策略为保持量化
+            handle.buffer = compute::make_device_buffer(host.size());
+            handle.buffer->copy_from_host(host.data(),host.size());
+            return handle;
+        }
+        // 不是16或32的走这里
+
+
+        else {
+            std::vector<uint16_t> host = load_as_fp16(*tensor);
+            // 将 tensor 转换为 FP16
+            handle.buffer = compute::make_device_half_buffer(static_cast<size_t>(handle.element_count));
+            handle.buffer->copy_from_host(host.data(), host.size() * sizeof(uint16_t));
+            return handle;
+        }
+        // 16或者32的统一走fp16
+    }
+
+    WeightHandle WeightLoader::load_remote_required(const std::string& name) const {
+        const auto* tensor = gguf_.find_tensor(name);
+        require(tensor != nullptr, "missing required tensor: " + name);
+
+        WeightHandle handle;
+        handle.name = name;
+        handle.gguf_type = tensor->type;
+        handle.dims = tensor->dims;
+        handle.element_count = tensor->element_count();
         return handle;
     }
     // 根据张量名称加载一个必需的权重，并将其转换为 FP16 后拷贝到 GPU

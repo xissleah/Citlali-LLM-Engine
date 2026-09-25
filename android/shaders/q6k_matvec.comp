@@ -1,0 +1,100 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer WeightBuffer {
+    uint weight_words[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer InputBuffer {
+    uint input_words[];
+};
+
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    uint output_words[];
+};
+
+layout(push_constant) uniform Parameters {
+    uint in_features;
+    uint out_features;
+} parameters;
+
+shared float scratch[256];
+shared uint row_half_bits[2];
+
+uint load_byte(uint byte_offset) {
+    const uint word = weight_words[byte_offset >> 2U];
+    return (word >> ((byte_offset & 3U) * 8U)) & 0xffU;
+}
+
+float load_half_from_weight(uint byte_offset) {
+    const uint bits = load_byte(byte_offset) |
+                      (load_byte(byte_offset + 1U) << 8U);
+    return unpackHalf2x16(bits).x;
+}
+
+float load_input_half(uint index) {
+    const vec2 values = unpackHalf2x16(input_words[index >> 1U]);
+    return (index & 1U) == 0U ? values.x : values.y;
+}
+
+float dequant_q6k_value(uint block_offset, uint index) {
+    const uint half_index = index / 128U;
+    const uint in_half = index % 128U;
+    const uint part = in_half / 32U;
+    const uint item = in_half % 32U;
+    const uint scale_group = item / 16U;
+
+    const uint ql_byte = load_byte(
+        block_offset + half_index * 64U + (part % 2U) * 32U + item);
+    const uint qh_byte =
+        load_byte(block_offset + 128U + half_index * 32U + item);
+    const uint low4 = part < 2U ? (ql_byte & 0x0fU) : (ql_byte >> 4U);
+    const uint high2 = (qh_byte >> (part * 2U)) & 0x03U;
+    const int quant = int(low4 | (high2 << 4U)) - 32;
+
+    const uint scale_index =
+        half_index * 8U + scale_group + part * 2U;
+    const uint raw_scale = load_byte(block_offset + 192U + scale_index);
+    const int signed_scale =
+        raw_scale < 128U ? int(raw_scale) : int(raw_scale) - 256;
+    const float delta = load_half_from_weight(block_offset + 208U);
+    return delta * float(signed_scale) * float(quant);
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint blocks_per_row = parameters.in_features / 256U;
+
+    for (uint row_in_pair = 0U; row_in_pair < 2U; ++row_in_pair) {
+        const uint row = gl_WorkGroupID.x * 2U + row_in_pair;
+        float sum = 0.0;
+        if (row < parameters.out_features) {
+            const uint row_offset = row * blocks_per_row * 210U;
+            for (uint block_id = 0U; block_id < blocks_per_row; ++block_id) {
+                const uint block_offset = row_offset + block_id * 210U;
+                sum += dequant_q6k_value(block_offset, tid) *
+                       load_input_half(block_id * 256U + tid);
+            }
+        }
+
+        scratch[tid] = sum;
+        barrier();
+        for (uint stride = 128U; stride > 0U; stride >>= 1U) {
+            if (tid < stride) {
+                scratch[tid] += scratch[tid + stride];
+            }
+            barrier();
+        }
+        if (tid == 0U) {
+            row_half_bits[row_in_pair] =
+                packHalf2x16(vec2(scratch[0], 0.0)) & 0xffffU;
+        }
+        barrier();
+    }
+
+    if (tid == 0U) {
+        output_words[gl_WorkGroupID.x] =
+            row_half_bits[0] | (row_half_bits[1] << 16U);
+    }
+}

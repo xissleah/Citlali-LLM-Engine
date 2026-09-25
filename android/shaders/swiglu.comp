@@ -1,0 +1,39 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer GateBuffer {
+    uint gate_words[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer UpBuffer {
+    uint up_words[];
+};
+
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    uint output_words[];
+};
+
+layout(push_constant) uniform Parameters {
+    uint elements;
+} parameters;
+
+float silu(float value) {
+    return value / (1.0 + exp(-value));
+}
+
+void main() {
+    const uint word_index = gl_GlobalInvocationID.x;
+    const uint word_count = (parameters.elements + 1U) / 2U;
+    if (word_index >= word_count) {
+        return;
+    }
+
+    const vec2 gate = unpackHalf2x16(gate_words[word_index]);
+    const vec2 up = unpackHalf2x16(up_words[word_index]);
+    vec2 activated = vec2(silu(gate.x) * up.x, silu(gate.y) * up.y);
+    if (word_index * 2U + 1U >= parameters.elements) {
+        activated.y = 0.0;
+    }
+    output_words[word_index] = packHalf2x16(activated);
+}

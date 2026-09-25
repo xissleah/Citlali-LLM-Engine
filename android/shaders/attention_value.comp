@@ -1,0 +1,39 @@
+#version 450
+
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0, std430) readonly buffer ScoreBuffer { float scores[]; };
+layout(set = 0, binding = 1, std430) readonly buffer ValueCacheBuffer { uint value_words[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer { uint output_words[]; };
+layout(push_constant) uniform Parameters {
+    uint position; uint max_context; uint heads; uint kv_heads; uint head_dim;
+} p;
+
+float load_value(uint index) {
+    vec2 value = unpackHalf2x16(value_words[index >> 1U]);
+    return (index & 1U) == 0U ? value.x : value.y;
+}
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint word = gl_LocalInvocationID.x;
+    uint words_per_head = (p.head_dim + 1U) / 2U;
+    if (head >= p.heads || word >= words_per_head) return;
+    uint kv_head = head / (p.heads / p.kv_heads);
+    float maximum = -3.402823466e+38;
+    for (uint token = 0U; token <= p.position; ++token)
+        maximum = max(maximum, scores[head * p.max_context + token]);
+    float denominator = 0.0;
+    for (uint token = 0U; token <= p.position; ++token)
+        denominator += exp(scores[head * p.max_context + token] - maximum);
+    uint dim0 = word * 2U;
+    uint dim1 = dim0 + 1U;
+    float a = 0.0;
+    float b = 0.0;
+    for (uint token = 0U; token <= p.position; ++token) {
+        float probability = exp(scores[head * p.max_context + token] - maximum) / denominator;
+        uint base = (token * p.kv_heads + kv_head) * p.head_dim;
+        a += probability * load_value(base + dim0);
+        if (dim1 < p.head_dim) b += probability * load_value(base + dim1);
+    }
+    output_words[(head * p.head_dim >> 1U) + word] = packHalf2x16(vec2(a, b));
+}

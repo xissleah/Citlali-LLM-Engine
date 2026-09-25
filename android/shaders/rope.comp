@@ -1,0 +1,35 @@
+#version 450
+
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer { uint input_words[]; };
+layout(set = 0, binding = 1, std430) readonly buffer UnusedBuffer { uint unused_words[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer { uint output_words[]; };
+layout(push_constant) uniform Parameters { uint heads; uint head_dim; uint position; float theta; } p;
+
+float load_half(uint index) {
+    vec2 value = unpackHalf2x16(input_words[index >> 1U]);
+    return (index & 1U) == 0U ? value.x : value.y;
+}
+
+void main() {
+    uint word = gl_GlobalInvocationID.x;
+    uint half_dim = p.head_dim / 2U;
+    uint words_per_head = p.head_dim / 2U;
+    if (word >= p.heads * words_per_head) return;
+    uint head = word / words_per_head;
+    uint local_word = word - head * words_per_head;
+    uint base = head * p.head_dim;
+    vec2 result;
+    for (uint lane = 0U; lane < 2U; ++lane) {
+        uint dim = local_word * 2U + lane;
+        uint pair_dim = dim < half_dim ? dim : dim - half_dim;
+        float angle = float(p.position) * pow(p.theta, -float(2U * pair_dim) / float(p.head_dim));
+        float first = load_half(base + pair_dim);
+        float second = load_half(base + half_dim + pair_dim);
+        float rotated = dim < half_dim
+            ? first * cos(angle) - second * sin(angle)
+            : first * sin(angle) + second * cos(angle);
+        if (lane == 0U) result.x = rotated; else result.y = rotated;
+    }
+    output_words[(base >> 1U) + local_word] = packHalf2x16(result);
+}

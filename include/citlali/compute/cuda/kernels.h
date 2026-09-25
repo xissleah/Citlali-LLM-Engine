@@ -22,7 +22,15 @@ namespace citlali::compute {
     void launch_matvec_fp16(const uint16_t* weight, const uint16_t* input, uint16_t* output, int in_features, int out_features);
     //  FP16 稠密权重矩阵乘向量 out = input × W，QKV/FFN 投影核心计算
     void launch_matvec_fp16_to_float(const uint16_t* weight, const uint16_t* input, float* output, int in_features, int out_features);
-    //  矩阵乘结果直接输出 float，用于注意力分数计算（softmax 需要浮点）
+    //  矩阵乘法结果直接输出 float，用于注意力分数计算（softmax 需要浮点）
+    void launch_matvec_q4k(const uint8_t* weight, const uint16_t* input, uint16_t* output, int in_features, int out_features);
+    //  矩阵乘法权重为原量化q4k
+    void launch_matvec_q6k(const uint8_t* weight, const uint16_t* input, uint16_t* output, int in_features, int out_features);
+    //  矩阵乘法权重为原量化q6k
+    void launch_matvec_q6k_to_float(const uint8_t* weight, const uint16_t* input, float* output, int in_features, int out_features);
+    //  q6k输入，f32输出，因为计算logits时需要float
+    void launch_embed_q6k(const uint8_t* embedding, int32_t token_id, uint16_t* output, int hidden);
+    //  从 Q6_K 量化的 embedding 矩阵中读取一个 token 对应的行，并将其动态反量化为 FP16
     void launch_swiglu(const uint16_t* gate, const uint16_t* up, uint16_t* output, int n);
     //  激活函数swiglu
     void launch_rope(uint16_t* data, int heads, int head_dim, int position, float theta);
